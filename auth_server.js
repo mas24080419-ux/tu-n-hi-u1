@@ -11,9 +11,6 @@ const SUPABASE_PUBLISHABLE_KEY=process.env.SUPABASE_PUBLISHABLE_KEY||'';
 const SESSION_TTL_SEC=7*24*60*60;
 const buckets=new Map();
 
-// Temporary server-side fallback. These maps are intentionally marked non-persistent.
-// The API contract mirrors the dedicated Postgres schema so the frontend will not need
-// to change when DATABASE_URL is attached to energyguard-auth.
 const systemsByUser=new Map();
 const runsByUser=new Map();
 
@@ -33,12 +30,12 @@ function signPayload(payload){if(!SESSION_SECRET)throw Object.assign(new Error('
 function verifySession(token){if(!SESSION_SECRET||!token)return null;const parts=token.split('.');if(parts.length!==2)return null;const [body,sig]=parts;const expected=crypto.createHmac('sha256',SESSION_SECRET).update(body).digest('base64url');const a=Buffer.from(sig),b=Buffer.from(expected);if(a.length!==b.length||!crypto.timingSafeEqual(a,b))return null;try{const p=JSON.parse(Buffer.from(body,'base64url').toString('utf8'));if(!p.exp||p.exp<Math.floor(Date.now()/1000))return null;return p}catch{return null}}
 function bearer(req){const h=String(req.headers.authorization||'');return h.startsWith('Bearer ')?h.slice(7):''}
 function authUser(req){const p=verifySession(bearer(req));if(!p)throw Object.assign(new Error('Invalid or expired session.'),{status:401});return p}
-async function fetchJson(url,options={}){const ctl=new AbortController();const t=setTimeout(()=>ctl.abort(),12000);try{const r=await fetch(url,{...options,signal:ctl.signal,headers:{'User-Agent':'EnergyGuardAuth/1.2',...(options.headers||{})}});const d=await r.json().catch(()=>({}));if(!r.ok)throw Object.assign(new Error(d.error_description||d.msg||d.message||d.error||`Upstream HTTP ${r.status}`),{status:r.status===401?401:400});return d}finally{clearTimeout(t)}}
+async function fetchJson(url,options={}){const ctl=new AbortController();const t=setTimeout(()=>ctl.abort(),12000);try{const r=await fetch(url,{...options,signal:ctl.signal,headers:{'User-Agent':'EnergyGuardAuth/1.3',...(options.headers||{})}});const d=await r.json().catch(()=>({}));if(!r.ok)throw Object.assign(new Error(d.error_description||d.msg||d.message||d.error||`Upstream HTTP ${r.status}`),{status:r.status===401?401:400});return d}finally{clearTimeout(t)}}
 function finite(v,d=0){const n=Number(v);return Number.isFinite(n)?n:d}
 function clamp(v,a,b){return Math.max(a,Math.min(b,v))}
 function sessionFor(user,provider='unknown'){
   const now=Math.floor(Date.now()/1000);
-  const sessionToken=signPayload({iss:'energyguard-auth',sub:user.sub,email:user.email,name:user.name,picture:user.picture||null,provider,iat:now,exp:now+SESSION_TTL_SEC});
+  const sessionToken=signPayload({iss:'energyguard-auth',sub:user.sub,email:user.email||null,phone:user.phone||null,name:user.name,picture:user.picture||null,provider,iat:now,exp:now+SESSION_TTL_SEC});
   return {ok:true,user,provider,sessionToken,expiresAt:new Date((now+SESSION_TTL_SEC)*1000).toISOString()};
 }
 function cleanSystem(body={},existing={}){
@@ -70,18 +67,20 @@ async function handler(req,res){
   if(!rate(req))return send(res,429,{error:'Too many requests'});
   const url=new URL(req.url,`http://${req.headers.host||'localhost'}`);const path=url.pathname;
   try{
-    if(req.method==='GET'&&path==='/')return send(res,200,{name:'EnergyGuard Auth',version:'1.2.0'});
-    if(req.method==='GET'&&path==='/health')return send(res,200,{ok:true,service:'energyguard-auth',googleConfigured:Boolean(GOOGLE_CLIENT_ID),supabaseConfigured:Boolean(SUPABASE_URL&&SUPABASE_PUBLISHABLE_KEY),sessionConfigured:Boolean(SESSION_SECRET),storageMode:'memory-fallback'});
-    if(req.method==='GET'&&path==='/config')return send(res,200,{googleEnabled:Boolean(GOOGLE_CLIENT_ID),googleClientId:GOOGLE_CLIENT_ID||null,supabaseEnabled:Boolean(SUPABASE_URL&&SUPABASE_PUBLISHABLE_KEY),supabaseUrl:SUPABASE_URL||null,supabasePublishableKey:SUPABASE_PUBLISHABLE_KEY||null,sessionTtlSeconds:SESSION_TTL_SEC});
+    if(req.method==='GET'&&path==='/')return send(res,200,{name:'EnergyGuard Auth',version:'1.3.0'});
+    if(req.method==='GET'&&path==='/health')return send(res,200,{ok:true,service:'energyguard-auth',googleConfigured:Boolean(GOOGLE_CLIENT_ID),supabaseConfigured:Boolean(SUPABASE_URL&&SUPABASE_PUBLISHABLE_KEY),phoneSessionSupported:true,sessionConfigured:Boolean(SESSION_SECRET),storageMode:'memory-fallback'});
+    if(req.method==='GET'&&path==='/config')return send(res,200,{googleEnabled:Boolean(GOOGLE_CLIENT_ID),googleClientId:GOOGLE_CLIENT_ID||null,supabaseEnabled:Boolean(SUPABASE_URL&&SUPABASE_PUBLISHABLE_KEY),supabaseUrl:SUPABASE_URL||null,supabasePublishableKey:SUPABASE_PUBLISHABLE_KEY||null,phoneSessionSupported:true,sessionTtlSeconds:SESSION_TTL_SEC});
     if(req.method==='GET'&&path==='/storage/status')return send(res,200,{ok:true,persistent:false,mode:'memory-fallback',database:'energyguard-db',databaseConfigured:false,note:'API contract is ready. Attach DATABASE_URL to enable Postgres persistence.'});
     if(req.method==='POST'&&path==='/supabase/session'){
       if(!SUPABASE_URL||!SUPABASE_PUBLISHABLE_KEY)return send(res,503,{error:'Supabase Auth is not configured for EnergyGuard.'});
       const body=await readJson(req);const accessToken=String(body.accessToken||'');if(!accessToken||accessToken.length>12000)return send(res,400,{error:'Missing Supabase access token.'});
       const u=await fetchJson(`${SUPABASE_URL}/auth/v1/user`,{headers:{apikey:SUPABASE_PUBLISHABLE_KEY,Authorization:`Bearer ${accessToken}`}});
-      if(!u?.id||!u?.email)return send(res,401,{error:'Invalid Supabase user session.'});
+      if(!u?.id||(!u?.email&&!u?.phone))return send(res,401,{error:'Invalid Supabase user session.'});
       const meta=u.user_metadata&&typeof u.user_metadata==='object'?u.user_metadata:{};
-      const user={sub:u.id,email:u.email,name:meta.full_name||meta.name||u.email,picture:meta.avatar_url||meta.picture||null};
-      return send(res,200,sessionFor(user,'supabase-email'));
+      const label=u.email||u.phone||'EnergyGuard User';
+      const user={sub:u.id,email:u.email||null,phone:u.phone||null,name:meta.full_name||meta.name||label,picture:meta.avatar_url||meta.picture||null};
+      const provider=u.app_metadata?.provider==='phone'?'supabase-phone':'supabase-email';
+      return send(res,200,sessionFor(user,provider));
     }
     if(req.method==='POST'&&path==='/google'){
       if(!GOOGLE_CLIENT_ID)return send(res,503,{error:'Google Login is not configured for EnergyGuard yet.'});
@@ -89,10 +88,10 @@ async function handler(req,res){
       const token=await fetchJson(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(credential)}`);
       if(token.aud!==GOOGLE_CLIENT_ID)return send(res,401,{error:'Invalid token audience.'});
       if(!(token.email_verified==='true'||token.email_verified===true))return send(res,401,{error:'Google email is not verified.'});
-      const user={sub:token.sub,email:token.email,name:token.name||token.email,picture:token.picture||null};
+      const user={sub:token.sub,email:token.email,phone:null,name:token.name||token.email,picture:token.picture||null};
       return send(res,200,sessionFor(user,'google'));
     }
-    if(req.method==='GET'&&path==='/me'){const p=authUser(req);return send(res,200,{ok:true,user:{sub:p.sub,email:p.email,name:p.name,picture:p.picture||null},provider:p.provider||null,expiresAt:new Date(p.exp*1000).toISOString()});}
+    if(req.method==='GET'&&path==='/me'){const p=authUser(req);return send(res,200,{ok:true,user:{sub:p.sub,email:p.email||null,phone:p.phone||null,name:p.name,picture:p.picture||null},provider:p.provider||null,expiresAt:new Date(p.exp*1000).toISOString()});}
     if(req.method==='GET'&&path==='/systems'){const p=authUser(req);return send(res,200,{ok:true,persistent:false,systems:systemsByUser.get(p.sub)||[]});}
     if(req.method==='POST'&&path==='/systems'){const p=authUser(req);const body=await readJson(req);const list=[...(systemsByUser.get(p.sub)||[])];const idx=list.findIndex(x=>x.id===body.id);const item=cleanSystem(body,idx>=0?list[idx]:{});if(idx>=0)list[idx]=item;else{if(list.length>=20)return send(res,400,{error:'Maximum 20 systems per account in fallback mode.'});list.push(item)}systemsByUser.set(p.sub,list);return send(res,200,{ok:true,persistent:false,system:item});}
     if(req.method==='POST'&&path==='/systems/delete'){const p=authUser(req);const body=await readJson(req);const id=String(body.id||'');const list=(systemsByUser.get(p.sub)||[]).filter(x=>x.id!==id);systemsByUser.set(p.sub,list);return send(res,200,{ok:true,persistent:false});}
