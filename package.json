@@ -1,0 +1,13 @@
+{
+  "name": "energyguard-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Independent API for EnergyGuard smart energy platform",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
